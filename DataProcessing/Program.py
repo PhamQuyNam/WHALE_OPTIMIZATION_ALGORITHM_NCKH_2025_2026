@@ -1,43 +1,45 @@
 import pandas as pd
 import numpy as np
-from scipy.sparse import csr_matrix
+from scipy.sparse import csr_matrix, save_npz
+import os
+import pickle
 
 
 class MovieLensDataProcessor:
     """
-    Lớp xử lý và chuẩn bị dữ liệu MovieLens cho mô hình Recommender System.
-    Đầu ra chính là User-Item Matrix và Item Feature Matrix.
+    Lớp xử lý và chuẩn bị dữ liệu MovieLens, bao gồm Temporal Split.
     """
 
     def __init__(self, ratings_file='ratings.dat', movies_file='movies.dat',
-                 min_user_interactions=5, min_item_interactions=5):
-        # 1. Khởi tạo các tham số cơ bản
+                 min_user_interactions=5, min_item_interactions=5, test_ratio=0.2):
+
         self.ratings_file = ratings_file
         self.movies_file = movies_file
         self.MIN_USER_INTERACTIONS = min_user_interactions
         self.MIN_ITEM_INTERACTIONS = min_item_interactions
+        self.TEST_RATIO = test_ratio  # Tỷ lệ dữ liệu test (ví dụ: 0.2 cho 20%)
 
-        # 2. Các DataFrame/Matrix sẽ được tạo ra
+        # DataFrames
         self.ratings_df = None
         self.movies_df = None
-        self.ratings_df_filtered = None
-        self.user_item_matrix = None
-        self.sparse_matrix = None
-        self.item_feature_matrix = None
+        self.ratings_df_filtered = None  # DataFrame đã lọc, chứa cả u_idx và i_idx
 
-        # 3. Ánh xạ ID
+        # Ma trận và ánh xạ
+        self.sparse_matrix_train = None
+        self.sparse_matrix_test = None
+        self.item_feature_matrix = None
         self.user_map = None
         self.item_map = None
 
     def _load_data(self):
-        """Tải dữ liệu thô từ file .dat."""
+        """Tải dữ liệu thô từ file .dat và giữ lại timestamp."""
         print("--- 1. Tải Dữ Liệu Thô ---")
 
-        # Tải Ratings
+        # Tải Ratings (GIỮ LẠI TIMESTAMP)
         self.ratings_df = pd.read_csv(
             self.ratings_file, sep='::', engine='python', header=None,
             names=['user_id', 'item_id', 'rating', 'timestamp']
-        )[['user_id', 'item_id', 'rating']]
+        )  # Giữ tất cả 4 cột ban đầu
 
         # Tải Movies
         self.movies_df = pd.read_csv(
@@ -75,41 +77,72 @@ class MovieLensDataProcessor:
 
         self.ratings_df_filtered['u_idx'] = self.ratings_df_filtered['user_id'].map(self.user_map)
         self.ratings_df_filtered['i_idx'] = self.ratings_df_filtered['item_id'].map(self.item_map)
-        print("Mã hóa hoàn tất. Dữ liệu sẵn sàng cho ma trận.")
+        print("Mã hóa hoàn tất.")
 
-    def _create_interaction_matrix(self):
-        """Tạo Ma trận tương tác User-Item."""
-        print("--- 4. Tạo Ma Trận Tương Tác ---")
+    def _temporal_split(self):
+        """
+        Chia dữ liệu thành Train và Test dựa trên timestamp (Temporal Split).
+        Train: Tương tác cũ hơn. Test: Tương tác mới hơn.
+        """
+        print(f"--- 4. Temporal Split (Tỉ lệ Test: {self.TEST_RATIO * 100}%) ---")
+
+        # 1. Sắp xếp theo User và sau đó theo Timestamp
+        df = self.ratings_df_filtered.sort_values(by=['u_idx', 'timestamp']).reset_index(drop=True)
+
+        # 2. Đánh dấu các tương tác cho tập Test (Lấy X% tương tác mới nhất của mỗi User)
+        df['rank'] = df.groupby('u_idx')['timestamp'].rank(method='first', ascending=False)
+
+        # Tính ngưỡng chia
+        df['count'] = df.groupby('u_idx')['u_idx'].transform('count')
+        test_size_per_user = (df['count'] * self.TEST_RATIO).apply(np.ceil)
+
+        # Nếu rank <= test_size_per_user, đó là tương tác mới nhất và đưa vào test
+        df_test = df[df['rank'] <= test_size_per_user]
+        df_train = df[df['rank'] > test_size_per_user]
+
+        # Đảm bảo mỗi user có ít nhất 1 tương tác trong tập train
+        # Lọc những users bị đẩy toàn bộ tương tác vào test (nếu có)
+        users_in_train = df_train['u_idx'].unique()
+        df_test = df_test[df_test['u_idx'].isin(users_in_train)]
+
+        print(f"Train samples: {len(df_train)}, Test samples: {len(df_test)}")
+
+        return df_train, df_test
+
+    def _create_interaction_matrix(self, df_train, df_test):
+        """Tạo Ma trận tương tác Train và Test thưa thớt."""
+        print("--- 5. Tạo Ma Trận Tương Tác Thưa Thớt ---")
         num_users = self.ratings_df_filtered['u_idx'].nunique()
         num_items = self.ratings_df_filtered['i_idx'].nunique()
 
-        # Ma trận dày (dense matrix) - dễ dùng cho khởi tạo Matrix Factorization
-        self.user_item_matrix = self.ratings_df_filtered.pivot(
-            index='u_idx', columns='i_idx', values='rating'
-        ).fillna(0)
-
-        # Ma trận thưa thớt (sparse matrix) - hiệu quả bộ nhớ
-        self.sparse_matrix = csr_matrix((
-            self.ratings_df_filtered['rating'].values,
-            (self.ratings_df_filtered['u_idx'].values, self.ratings_df_filtered['i_idx'].values)
+        # Tạo Sparse Matrix cho tập Train
+        self.sparse_matrix_train = csr_matrix((
+            df_train['rating'].values,
+            (df_train['u_idx'].values, df_train['i_idx'].values)
         ), shape=(num_users, num_items))
 
-        print(f"Kích thước Ma trận (dày/thưa): {self.user_item_matrix.shape}")
+        # Tạo Sparse Matrix cho tập Test
+        self.sparse_matrix_test = csr_matrix((
+            df_test['rating'].values,
+            (df_test['u_idx'].values, df_test['i_idx'].values)
+        ), shape=(num_users, num_items))
+
+        # Dữ liệu train matrix (dày) - Chỉ cần cho khởi tạo ban đầu, không cần lưu
+        self.user_item_matrix = self.sparse_matrix_train.toarray()
+
+        print(f"Kích thước Train Matrix: {self.sparse_matrix_train.shape}")
+        print(f"Kích thước Test Matrix: {self.sparse_matrix_test.shape}")
 
     def _create_item_feature_matrix(self):
         """Tạo Item Feature Matrix (Multi-Hot Encoding cho Genres)."""
-        print("--- 5. Tạo Ma Trận Thuộc Tính (Genre) ---")
+        print("--- 6. Tạo Ma Trận Thuộc Tính (Genre) ---")
         movies_df_filtered = self.movies_df[
             self.movies_df['item_id'].isin(self.ratings_df_filtered['item_id'].unique())].copy()
 
-        # Ánh xạ item_id gốc sang item_id mới (i_idx)
         movies_df_filtered['i_idx'] = movies_df_filtered['item_id'].map(self.item_map)
         movies_df_filtered = movies_df_filtered.sort_values(by='i_idx').reset_index(drop=True)
 
-        # Multi-Hot Encoding cho Genres
         genres = movies_df_filtered['genres'].str.get_dummies('|')
-
-        # Kết hợp và lấy ma trận feature
         self.item_feature_matrix = genres.values
 
         print(f"Kích thước Ma trận Thuộc tính: {self.item_feature_matrix.shape}")
@@ -119,12 +152,16 @@ class MovieLensDataProcessor:
         self._load_data()
         self._filter_interactions()
         self._encode_ids()
-        self._create_interaction_matrix()
+
+        # Chạy Temporal Split và tạo ma trận
+        df_train, df_test = self._temporal_split()
+        self._create_interaction_matrix(df_train, df_test)
+
         self._create_item_feature_matrix()
 
         return {
-            'user_item_matrix': self.user_item_matrix,
-            'sparse_matrix': self.sparse_matrix,
+            'sparse_matrix_train': self.sparse_matrix_train,
+            'sparse_matrix_test': self.sparse_matrix_test,
             'item_feature_matrix': self.item_feature_matrix,
             'user_map': self.user_map,
             'item_map': self.item_map
@@ -132,52 +169,44 @@ class MovieLensDataProcessor:
 
     def save_processed_data(self, output_dir='processed_data'):
         """Lưu các ma trận và ánh xạ ID đã xử lý ra file."""
-        import os
-        import pickle
+        if self.sparse_matrix_train is None or self.item_feature_matrix is None:
+            print("Lỗi: Dữ liệu chưa được xử lý. Vui lòng chạy run_pipeline() trước.")
+            return
 
-        # Tạo thư mục đầu ra nếu chưa tồn tại
         if not os.path.exists(output_dir):
             os.makedirs(output_dir)
 
         print(f"--- Lưu dữ liệu đã xử lý vào thư mục '{output_dir}' ---")
 
-        # 1. Lưu Ma trận tương tác (Sparse Matrix - Hiệu quả nhất)
-        # Sử dụng định dạng .npz cho ma trận thưa thớt
-        from scipy.sparse import save_npz
-        save_npz(os.path.join(output_dir, 'sparse_matrix.npz'), self.sparse_matrix)
-        print("Đã lưu sparse_matrix.npz")
+        # 1. Lưu Ma trận tương tác Train và Test
+        save_npz(os.path.join(output_dir, 'sparse_matrix_train.npz'), self.sparse_matrix_train)
+        save_npz(os.path.join(output_dir, 'sparse_matrix_test.npz'), self.sparse_matrix_test)
+        print("Đã lưu sparse_matrix_train.npz và sparse_matrix_test.npz")
 
         # 2. Lưu Ma trận thuộc tính Item (NumPy array)
         np.save(os.path.join(output_dir, 'item_feature_matrix.npy'), self.item_feature_matrix)
         print("Đã lưu item_feature_matrix.npy")
 
         # 3. Lưu Ánh xạ ID (Maps)
-        # Sử dụng pickle để lưu dictionary
         with open(os.path.join(output_dir, 'user_map.pkl'), 'wb') as f:
             pickle.dump(self.user_map, f)
         with open(os.path.join(output_dir, 'item_map.pkl'), 'wb') as f:
             pickle.dump(self.item_map, f)
         print("Đã lưu user_map.pkl và item_map.pkl")
-# --- CÁCH SỬ DỤNG ---
-# processor = MovieLensDataProcessor()
-# data_output = processor.run_pipeline()
 
-# ma_tran_tuong_tac = data_output['user_item_matrix']
-# ma_tran_thuoc_tinh = data_output['item_feature_matrix']
+        print("\n--- HOÀN TẤT LƯU TRỮ ---")
 
-# print("\n--- KẾT QUẢ CUỐI CÙNG ---")
-# print(f"Ma trận tương tác (dày) đã sẵn sàng để truyền vào mô hình WOA: \n{ma_tran_tuong_tac.head()}")
 
 # --- CÁCH SỬ DỤNG VÀ CHẠY CHƯƠNG TRÌNH ---
+if __name__ == '__main__':
+    # 1. Khởi tạo đối tượng xử lý (Có thể tùy chỉnh test_ratio)
+    # Ví dụ: Tỷ lệ 80/20
+    processor = MovieLensDataProcessor(test_ratio=0.2)
 
-# 1. Khởi tạo đối tượng xử lý
-processor = MovieLensDataProcessor()
+    # 2. Chạy toàn bộ pipeline xử lý
+    data_output = processor.run_pipeline()
 
-# 2. Chạy toàn bộ pipeline xử lý (Đảm bảo dữ liệu được tạo ra)
-data_output = processor.run_pipeline()
+    # 3. GỌI PHƯƠNG THỨC LƯU DỮ LIỆU ĐÃ XỬ LÝ
+    processor.save_processed_data(output_dir='processed_data_split')
 
-# 3. GỌI PHƯƠNG THỨC LƯU DỮ LIỆU ĐÃ XỬ LÝ (Đây là bước bị thiếu/comment)
-processor.save_processed_data(output_dir='processed_data')
-
-print("\n--- HOÀN TẤT ---")
-print("Vui lòng kiểm tra thư mục 'processed_data' trong thư mục hiện tại.")
+    print("\nKiểm tra thư mục 'processed_data_split' để xem kết quả.")
